@@ -457,6 +457,18 @@ Notice:
             return `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;
         },
 
+        // 服务端日期可能是 09/07/2026（补零），本地是 9/7/2026（不补零），
+        // 直接字符串比较会漏掉当天全部卡片，因此统一去掉前导零再比。
+        sameDateStr(a, b) {
+            const norm = (s) => {
+                if (!s) return "";
+                const m = String(s).trim().match(/^(\d{1,2})\D(\d{1,2})\D(\d{2,4})$/);
+                if (!m) return String(s).trim();
+                return `${Number(m[1])}/${Number(m[2])}/${m[3].length === 2 ? "20" + m[3] : m[3]}`;
+            };
+            return norm(a) === norm(b);
+        },
+
         getRandomUUID() {
             return crypto.randomUUID().replace(/-/g, "").toUpperCase();
         },
@@ -1022,7 +1034,7 @@ Notice:
                         const items = JSON.parse(cleanDash.slice(start, end).replace(/\\\"/g, '"'));
                         for (const item of items) {
                             if (!item || item.points <= 0 || item.isCompleted) continue;
-                            if (item.date && item.date !== RewardsAuto.state.dateNowStr) continue;
+                            if (item.date && !Utils.sameDateStr(item.date, RewardsAuto.state.dateNowStr)) continue;
                             const offerId = item.offerId || item.offerid;
                             if (!offerId || !item.hash || /locked/i.test(offerId)) continue;
                             dashboardCards.push({
