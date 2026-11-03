@@ -261,6 +261,7 @@ Notice:
             ip: "",
             ipInfo: "",
             startTime: 0,
+            accountName: "",
         }
     };
 
@@ -382,6 +383,56 @@ Notice:
                 RewardsAuto.state.sendMSG = `${icon} ${msg}`;
                 this.sendWebhook();
             }
+        },
+
+        // 今日累计统计（持久化，按日期自动重置）
+        getTodayStats() {
+            const today = Utils.getTodayNum();
+            const stats = GM_getValue("Config.todayStats", null);
+            if (!stats || stats.date !== today) {
+                return { date: today, promosClaimed: 0, readCount: 0, warnings: [] };
+            }
+            stats.promosClaimed = stats.promosClaimed || 0;
+            stats.readCount = stats.readCount || 0;
+            stats.warnings = stats.warnings || [];
+            return stats;
+        },
+        saveTodayStats(stats) {
+            GM_setValue("Config.todayStats", stats);
+        },
+        addTodayWarning(msg) {
+            const stats = this.getTodayStats();
+            if (!stats.warnings.includes(msg)) {
+                stats.warnings.push(msg);
+                this.saveTodayStats(stats);
+            }
+        },
+        // 构建今日累计明细（跨轮次、跨运行）
+        getTodayDetailLines() {
+            const today = RewardsAuto.state.dateNowNum || Utils.getTodayNum();
+            const stats = this.getTodayStats();
+            const lines = [];
+
+            if (TaskManager.signDate === today && TaskManager.signPoint >= 0) {
+                lines.push(`💻 签入: +${TaskManager.signPoint} 积分`);
+            }
+            if (TaskManager.readDate === today) {
+                lines.push(`📖 阅读: 完成${stats.readCount > 0 ? `（${stats.readCount} 篇）` : ""}`);
+            } else if (stats.readCount > 0) {
+                lines.push(`📖 阅读: 已读 ${stats.readCount} 篇`);
+            }
+            if (stats.promosClaimed > 0) {
+                lines.push(`🧩 活动卡片: 已领取 ${stats.promosClaimed} 个`);
+            }
+
+            const dailySetCount = GM_getValue("Config.dailySetProcessed", [])
+                .filter(item => item?.date === today).length;
+            if (dailySetCount > 0) {
+                lines.push(`📅 每日活动: 已点击 ${dailySetCount} 个`);
+            }
+
+            lines.push(...stats.warnings);
+            return lines;
         },
 
         // 发送webhook通知
@@ -669,7 +720,8 @@ Notice:
                         return [decodeURIComponent(match[0])];
                     }
                 }
-                Utils.log("🔴", "授权码获取超时", true);
+                Utils.log("🔴", "授权码获取超时");
+                Utils.addTodayWarning("⚠️ 授权码获取超时");
                 return false;
             };
 
@@ -684,7 +736,7 @@ Notice:
                     if (!retry) return false;
                     return await this.renewToken();
                 }
-                Utils.log("🟢", "Token获取成功！", true);
+                Utils.log("🟢", "Token获取成功！");
                 return true;
             } else {
                 const url = `https://login.live.com/oauth20_token.srf?client_id=0000000040170455&refresh_token=${encodeURIComponent(refreshToken)}&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&grant_type=REFRESH_TOKEN`;
@@ -866,6 +918,46 @@ Notice:
                 }
             }
             return false;
+        },
+
+        // 获取当前登录账号（用于通知中区分账号）
+        async getAccountName() {
+            if (RewardsAuto.state.accountName) return RewardsAuto.state.accountName;
+
+            // 方法1：Rewards 用户信息接口
+            try {
+                const res = await Utils.xhr({
+                    url: "https://rewards.bing.com/api/getuserinfo?type=1",
+                    headers: { "x-requested-with": "XMLHttpRequest" }
+                });
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    const info = data.userInfo || data.user || data.dashboard?.userInfo || data;
+                    const name = info.userName || info.email || info.displayName || info.name || "";
+                    if (name) {
+                        RewardsAuto.state.accountName = String(name);
+                        return RewardsAuto.state.accountName;
+                    }
+                }
+            } catch (e) {
+                Utils.log("🟡", `账号信息接口获取失败: ${e.message}`);
+            }
+
+            // 方法2：从 Rewards 页面数据中提取
+            try {
+                const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+                const clean = html.replace(/\\"/g, '"');
+                const match = clean.match(/"userName":"([^"]+)"/)
+                    || clean.match(/"email":"([^"@]+@[^"]+)"/);
+                if (match) {
+                    RewardsAuto.state.accountName = match[1];
+                    return RewardsAuto.state.accountName;
+                }
+            } catch (e) {
+                Utils.log("🟡", `账号信息页面解析失败: ${e.message}`);
+            }
+
+            return "";
         },
 
         async signApp() {
@@ -1540,7 +1632,8 @@ Notice:
             GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
 
             if (RewardsAuto.state.restrictedTimes >= 3) {
-                Utils.log("🔴", "搜索受限或账号异常，已中断今日搜索！", true);
+                Utils.log("🔴", "搜索受限或账号异常，已中断今日搜索！");
+                Utils.addTodayWarning("⚠️ 搜索受限或账号异常，已中断今日搜索");
                 return true;
             }
             return false;
@@ -1603,7 +1696,7 @@ Notice:
                 this.signDate = RewardsAuto.state.dateNowNum;
                 GM_setValue("Config.signPoint", totalPoint);
                 this.save();
-                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`, true);
+                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
             } else {
                 this.signTimes++;
                 Utils.log("🟡", `签入失败，稍后重试`);
@@ -1645,12 +1738,17 @@ Notice:
                 return;
             }
 
+            // 累计今日阅读篇数
+            const stats = Utils.getTodayStats();
+            stats.readCount += successCount;
+            Utils.saveTodayStats(stats);
+
             // 二次验证：确认服务器端进度真的满了
             const verify = await API.getReadProgress();
             if (verify && verify.progress >= verify.max) {
                 this.readDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("🔵", "阅读任务完成！", true);
+                Utils.log("🔵", "阅读任务完成！");
             } else {
                 this.readTimes++;
                 Utils.log("🟡", `阅读已执行但未完成，下次继续`);
@@ -1691,6 +1789,13 @@ Notice:
                 result ? ok++ : fail++;
             }
 
+            // 累计今日已领取的卡片数
+            if (ok > 0) {
+                const stats = Utils.getTodayStats();
+                stats.promosClaimed += ok;
+                Utils.saveTodayStats(stats);
+            }
+
             if (fail > 0 || ok === 0) {
                 this.promosTimes++;
                 Utils.log("🟡", `活动本轮未完成: ${ok}成功/${fail}失败，下一轮继续`);
@@ -1702,7 +1807,7 @@ Notice:
             if (remaining !== null && remaining.length === 0) {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败`, true);
+                Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败`);
             } else {
                 this.promosTimes++;
                 Utils.log("🟡", "活动请求已提交，但服务端仍有未完成卡片，下一轮继续");
@@ -1797,7 +1902,7 @@ Notice:
                     GM_setValue("Config.restrictedTimes", 0);
                     GM_setValue("Config.lastSearchProgress", -1);
                     const mobileReport = hasMobile ? `\n📱 移动端: ${finalInfo.mobile.progress}/${finalInfo.mobile.max}` : "";
-                    Utils.log("🔵", `🔍 搜索任务完成！\n💻 PC端: ${finalInfo.pc.progress}/${finalInfo.pc.max}${mobileReport}`, true);
+                    Utils.log("🔵", `🔍 搜索任务完成！\n💻 PC端: ${finalInfo.pc.progress}/${finalInfo.pc.max}${mobileReport}`);
                 } else {
                     const mobileReport = hasMobile ? `\n📱 移动端: ${finalInfo.mobile.progress}/${finalInfo.mobile.max}` : "";
                     Utils.log("🟡", `搜索已执行，配额未满\n💻 PC端: ${finalInfo.pc.progress}/${finalInfo.pc.max}${mobileReport}`);
@@ -1828,7 +1933,7 @@ Notice:
                 const clickedCount = await this.clickDailySetLinks(processedIds, processed);
                 if (clickedCount > 0) {
                     GM_setValue(processedKey, processed);
-                    Utils.log("🔵", `每日活动完成，点击了 ${clickedCount} 个活动`, true);
+                    Utils.log("🔵", `每日活动完成，点击了 ${clickedCount} 个活动`);
                 } else {
                     Utils.log("🟡", "未找到可点击的每日活动链接");
                 }
@@ -1975,7 +2080,8 @@ Notice:
             if (regionOK) {
                 isTokenOK = await API.renewToken();
                 if (!isTokenOK) {
-                    Utils.log("🟡", "Token失败，跳过签入/阅读", true);
+                    Utils.log("🟡", "Token失败，跳过签入/阅读");
+                    Utils.addTodayWarning("⚠️ Token 失败，已跳过签入/阅读");
                 }
             } else {
                 Utils.log("🟡", "地区检测失败，尝试执行搜索任务...");
@@ -2033,16 +2139,20 @@ Notice:
 
             GM_setValue(stopKey, today);
             GM_setValue("Config.allTaskScanEmptyRounds", 3);
-            Utils.log("✅", "连续 3 轮未发现新任务或未完成任务进度，今日停止全任务扫描", true);
+            Utils.log("✅", "连续 3 轮未发现新任务或未完成任务进度，今日停止全任务扫描");
 
             // 任务完成汇总
             const endTime = Utils.getTimestamp();
             const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
             
-            const info = await API.getRewardsInfo();
+            const [info, accountName] = await Promise.all([
+                API.getRewardsInfo(),
+                API.getAccountName()
+            ]);
             if (info) {
                 // 构建通知消息（简洁版，用于推送）
-                let notifyMsg = `🎉 任务完成！\n`;
+                let notifyMsg = `任务完成！\n`;
+                if (accountName) notifyMsg += `👤 账号: ${accountName}\n`;
                 notifyMsg += `💰 当前积分: ${info.balance}\n`;
                 notifyMsg += `🔍 PC搜索: ${info.pc.progress}/${info.pc.max}\n`;
                 notifyMsg += `📱 移动搜索: ${info.mobile.progress}/${info.mobile.max}\n`;
@@ -2057,9 +2167,15 @@ Notice:
                     notifyMsg += `📅 本月: ${info.history.month.toLocaleString()}\n`;
                 }
                 notifyMsg += `⏱️ 用时: ${totalTime}秒`;
-                
+
+                // 今日累计明细（跨轮次、跨运行统计）
+                const todayLines = Utils.getTodayDetailLines();
+                if (todayLines.length > 0) {
+                    notifyMsg += `\n──────────\n📋 今日累计\n`;
+                    notifyMsg += todayLines.join("\n");
+                }
+
                 // 发送通知
-                RewardsAuto.state.sendMSG = notifyMsg;
                 Utils.log("🎉", notifyMsg, true);
                 
                 // 构建详细日志（控制台显示）
@@ -2099,7 +2215,14 @@ Notice:
                 
                 Utils.log("📊", detailMsg);
             } else {
-                Utils.log("🎉", `任务执行完成！用时 ${totalTime} 秒`, true);
+                let fallbackMsg = `任务执行完成！用时 ${totalTime} 秒`;
+                if (accountName) fallbackMsg += `\n👤 账号: ${accountName}`;
+                const todayLines = Utils.getTodayDetailLines();
+                if (todayLines.length > 0) {
+                    fallbackMsg += `\n──────────\n📋 今日累计\n`;
+                    fallbackMsg += todayLines.join("\n");
+                }
+                Utils.log("🎉", fallbackMsg, true);
             }
         }
     };
