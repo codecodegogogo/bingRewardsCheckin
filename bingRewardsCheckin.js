@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bing rewards 签到
 // @namespace    https://rewards.bing.com/
-// @version      1.0
+// @version      1.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务
 // @author       leon
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
