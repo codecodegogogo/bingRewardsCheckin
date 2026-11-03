@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bing rewards 签到
 // @namespace    https://rewards.bing.com/
-// @version      1.2
+// @version      1.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务
 // @author       leon
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
@@ -49,6 +49,10 @@ Config:
         title: 持续检测（全部完成后是否继续）
         type: checkbox
         default: true
+    accountLabel:
+        title: 账号备注（显示在通知里）
+        type: text
+        description: 填写邮箱或账号名；留空则通知显示「未获取到」
     lock:
         title: 锁定国区（非大陆IP自动停止）
         type: checkbox
@@ -381,7 +385,7 @@ Notice:
             // 发送到外部通知接口
             if (push) {
                 RewardsAuto.state.sendMSG = `${icon} ${msg}`;
-                this.sendWebhook();
+                return this.sendWebhook();
             }
         },
 
@@ -394,7 +398,7 @@ Notice:
             }
             stats.promosClaimed = stats.promosClaimed || 0;
             stats.readCount = stats.readCount || 0;
-            stats.warnings = stats.warnings || [];
+            if (!Array.isArray(stats.warnings)) stats.warnings = [];
             return stats;
         },
         saveTodayStats(stats) {
@@ -425,8 +429,10 @@ Notice:
                 lines.push(`🧩 活动卡片: 已领取 ${stats.promosClaimed} 个`);
             }
 
-            const dailySetCount = GM_getValue("Config.dailySetProcessed", [])
-                .filter(item => item?.date === today).length;
+            const processed = GM_getValue("Config.dailySetProcessed", []);
+            const dailySetCount = Array.isArray(processed)
+                ? processed.filter(item => item?.date === today).length
+                : 0;
             if (dailySetCount > 0) {
                 lines.push(`📅 每日活动: 已点击 ${dailySetCount} 个`);
             }
@@ -920,89 +926,16 @@ Notice:
             return false;
         },
 
-        // 获取当前登录账号（用于通知中区分账号）
+        // 获取当前登录账号（用于通知中区分账号，由用户手动填写）
         async getAccountName() {
             if (RewardsAuto.state.accountName) return RewardsAuto.state.accountName;
 
-            const pickName = (obj) => {
-                if (!obj || typeof obj !== "object") return "";
-                const keys = ["email", "mail", "userName", "userPrincipalName",
-                    "preferred_username", "unique_name", "upn", "accountName",
-                    "displayName", "name"];
-                for (const key of keys) {
-                    if (typeof obj[key] === "string" && obj[key].trim()) return obj[key].trim();
-                }
-                return "";
-            };
-
-            const saveName = (name) => {
-                RewardsAuto.state.accountName = String(name);
-                Utils.log("🟢", `账号信息: ${RewardsAuto.state.accountName}`);
-                return RewardsAuto.state.accountName;
-            };
-
-            // 方法1：Rewards 用户信息接口（依赖登录 Cookie）
-            try {
-                const res = await Utils.xhr({
-                    url: "https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest",
-                    headers: { "x-requested-with": "XMLHttpRequest" }
-                });
-                if (Utils.isJSON(res)) {
-                    const data = JSON.parse(res);
-                    const info = data.userInfo || data.user || data.dashboard?.userInfo || data;
-                    const name = pickName(info);
-                    if (name) return saveName(name);
-                    Utils.log("🟡", "账号接口未返回用户名字段，尝试其他方式");
-                } else {
-                    Utils.log("🟡", "账号接口返回非 JSON，尝试其他方式");
-                }
-            } catch (e) {
-                Utils.log("🟡", `账号信息接口获取失败: ${e.message}`);
+            // 使用用户在脚本设置中填写的账号备注
+            const configuredLabel = String(GM_getValue("Config.accountLabel", "")).trim();
+            if (configuredLabel) {
+                RewardsAuto.state.accountName = configuredLabel;
+                return configuredLabel;
             }
-
-            // 方法2：Rewards App 接口（使用 Token）
-            try {
-                const res = await this.withTokenRetry(token => Utils.xhr({
-                    url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613",
-                    headers: {
-                        "content-type": "application/json; charset=UTF-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true"
-                    }
-                }));
-                if (res && Utils.isJSON(res)) {
-                    const data = JSON.parse(res);
-                    const root = data.response || data;
-                    const profile = root.userProfile || root.userInfo || root.profile || root.account || root.user;
-                    const name = pickName(profile) || pickName(root);
-                    if (name) return saveName(name);
-                    Utils.log("🟡", "App 接口未返回用户名字段，尝试其他方式");
-                }
-            } catch (e) {
-                Utils.log("🟡", `App 账号信息获取失败: ${e.message}`);
-            }
-
-            // 方法3：从 Rewards 页面数据中提取
-            try {
-                const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
-                const clean = html.replace(/\\"/g, '"');
-                const match = clean.match(/"userName":"([^"]+)"/)
-                    || clean.match(/"userPrincipalName":"([^"]+)"/)
-                    || clean.match(/"preferred_username":"([^"]+)"/)
-                    || clean.match(/"unique_name":"([^"]+)"/)
-                    || clean.match(/"accountName":"([^"]+)"/)
-                    || clean.match(/"email":"([^"@]+@[^"]+)"/)
-                    || clean.match(/"mail":"([^"@]+@[^"]+)"/)
-                    || clean.match(/"user":\{[^{}]*"displayName":"([^"]+)"/)
-                    || clean.match(/"profile":\{[^{}]*"displayName":"([^"]+)"/);
-                if (match) return saveName(match[1]);
-                Utils.log("🟡", "页面数据中未找到账号字段");
-            } catch (e) {
-                Utils.log("🟡", `账号信息页面解析失败: ${e.message}`);
-            }
-
             return "";
         },
 
@@ -2190,39 +2123,53 @@ Notice:
             // 任务完成汇总
             const endTime = Utils.getTimestamp();
             const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
-            
-            const [info, accountName] = await Promise.all([
-                API.getRewardsInfo(),
-                API.getAccountName()
-            ]);
+            Utils.log("📤", "扫描结束，正在生成汇总通知...");
+
+            let info = false;
+            let accountName = "";
+            try {
+                info = await API.getRewardsInfo();
+                accountName = await API.getAccountName();
+            } catch (e) {
+                Utils.log("🟡", `汇总信息获取异常: ${e.message}`);
+            }
             if (info) {
-                // 构建通知消息（简洁版，用于推送）
+                // 构建通知消息：上面汇总，下面详细
                 let notifyMsg = `任务完成！\n`;
                 notifyMsg += `👤 账号: ${accountName || "未获取到"}\n`;
                 notifyMsg += `💰 当前积分: ${info.balance}\n`;
-                notifyMsg += `🔍 PC搜索: ${info.pc.progress}/${info.pc.max}\n`;
-                notifyMsg += `📱 移动搜索: ${info.mobile.progress}/${info.mobile.max}\n`;
+                notifyMsg += `⏱️ 用时: ${totalTime}秒`;
+
+                // 今日累计明细（跨轮次、跨运行统计）
+                let todayLines = [];
+                try {
+                    todayLines = Utils.getTodayDetailLines();
+                } catch (e) {
+                    Utils.log("🟡", `今日累计明细生成失败: ${e.message}`);
+                }
+
+                // 详细数据统一放在汇总下方
+                const detailLines = [...todayLines];
+                detailLines.push(`🔍 PC搜索: ${info.pc.progress}/${info.pc.max}`);
+                detailLines.push(`📱 移动搜索: ${info.mobile.progress}/${info.mobile.max}`);
                 if (info.todayDetails && info.todayDetails.length > 0) {
                     for (const detail of info.todayDetails) {
                         if (detail.title !== '必应搜索') {
-                            notifyMsg += `✨ ${detail.title}: +${detail.points}\n`;
+                            detailLines.push(`✨ ${detail.title}: +${detail.points}`);
                         }
                     }
                 }
                 if (info.history) {
-                    notifyMsg += `📅 本月: ${info.history.month.toLocaleString()}\n`;
+                    detailLines.push(`📅 本月: ${info.history.month.toLocaleString()}`);
                 }
-                notifyMsg += `⏱️ 用时: ${totalTime}秒`;
+                if (detailLines.length === 0) detailLines.push("暂无记录");
 
-                // 今日累计明细（跨轮次、跨运行统计）
-                const todayLines = Utils.getTodayDetailLines();
-                if (todayLines.length > 0) {
-                    notifyMsg += `\n──────────\n📋 今日累计\n`;
-                    notifyMsg += todayLines.join("\n");
-                }
+                notifyMsg += `\n──────────\n📋 今日累计\n`;
+                notifyMsg += detailLines.join("\n");
 
-                // 发送通知
-                Utils.log("🎉", notifyMsg, true);
+                // 发送通知（等待推送完成，避免后台实例提前回收导致漏发）
+                await Utils.log("🎉", notifyMsg, true);
+                Utils.log("✅", "汇总通知已发送");
                 
                 // 构建详细日志（控制台显示）
                 let detailMsg = `📊 积分明细:\n`;
@@ -2261,14 +2208,19 @@ Notice:
                 
                 Utils.log("📊", detailMsg);
             } else {
-                let fallbackMsg = `任务执行完成！用时 ${totalTime} 秒`;
-                fallbackMsg += `\n👤 账号: ${accountName || "未获取到"}`;
-                const todayLines = Utils.getTodayDetailLines();
-                if (todayLines.length > 0) {
-                    fallbackMsg += `\n──────────\n📋 今日累计\n`;
-                    fallbackMsg += todayLines.join("\n");
+                let fallbackMsg = `任务完成！\n`;
+                fallbackMsg += `👤 账号: ${accountName || "未获取到"}\n`;
+                fallbackMsg += `⏱️ 用时: ${totalTime}秒`;
+                let todayLines = [];
+                try {
+                    todayLines = Utils.getTodayDetailLines();
+                } catch (e) {
+                    Utils.log("🟡", `今日累计明细生成失败: ${e.message}`);
                 }
-                Utils.log("🎉", fallbackMsg, true);
+                fallbackMsg += `\n──────────\n📋 今日累计\n`;
+                fallbackMsg += todayLines.length > 0 ? todayLines.join("\n") : "暂无记录";
+                await Utils.log("🎉", fallbackMsg, true);
+                Utils.log("✅", "汇总通知已发送");
             }
         }
     };
@@ -2575,7 +2527,10 @@ Notice:
             if (request.id === consumedId) return false;
             GM_setValue("Config.manualRunConsumedId", request.id);
             Utils.log("🚀", "收到手动运行请求，立即开始任务");
-            TaskManager.runAll(true);
+            try {
+                GM_notification({ title: "🚀 手动运行已开始", text: "任务完成后会发送汇总通知" });
+            } catch (_) {}
+            TaskManager.runAll(true).catch(e => Utils.log("🔴", `手动运行异常: ${e.message}`, true));
             return true;
         };
 
@@ -2608,7 +2563,9 @@ Notice:
         // 【防封号核心】随机延迟 8-17 秒启动，避免定时器特征
         const delay = Utils.randomRange(8000, 17000);
         Utils.log("⏳", `${delay/1000}秒后启动...`);
-        setTimeout(() => TaskManager.runAll(), delay);
+        setTimeout(() => {
+            TaskManager.runAll().catch(e => Utils.log("🔴", `自动运行异常: ${e.message}`, true));
+        }, delay);
     };
 
     // 清除可能影响搜索的 Cookie
