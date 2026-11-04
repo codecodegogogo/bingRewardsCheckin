@@ -100,6 +100,19 @@ Telegram 上收到的消息由三部分组成：
 - 脚本没有 `{{message}}` 占位符，正文统一用 `{{content_json}}`；直接写 `{{message}}` 不会被替换。
 - `topic` 里的 `lite` 换成你要订阅的主题，然后在 ntfy 客户端订阅同名主题。
 
+### 添加新的 Webhook 服务器
+
+Webhook 地址在脚本设置的「Webhook 地址」里填写。如果这个地址的域名没有在脚本头部声明过，还需要在 `@connect` 列表里加一行：
+
+```js
+// @connect      hooks.example.com
+```
+
+- 只写主机名，不要写 `https://`，也不要带路径。
+- 子域名要写完整，比如 `hooks.example.com`，不要只写 `example.com`。
+- 不建议写 `@connect *`，那等于放行所有域名。
+- 保存脚本后，ScriptCat 可能会要求确认一次新域名权限。
+
 ## 七、MIT 修改声明
 
 本项目基于一份已标注 MIT 许可证的多手修改版本继续维护。
