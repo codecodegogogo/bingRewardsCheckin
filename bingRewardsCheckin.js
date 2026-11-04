@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bing rewards 签到
 // @namespace    https://rewards.bing.com/
-// @version      1.1
+// @version      1.7
 // @description  每天在后台自动完成 Microsoft Rewards 任务
 // @author       leon
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
@@ -22,6 +22,7 @@
 // @connect      push.i-i.me
 // @connect      api.day.app
 // @connect      api.telegram.org
+// @connect      instabox.tech
 // @match        https://login.live.com/oauth20_desktop.srf*
 // @match        https://rewards.bing.com/*
 // @match        https://www.bing.com/*
@@ -41,7 +42,7 @@
 // @storageName  BingRewardsAuto_Shared
 // ==/UserScript==
 
-/* global GM_cookie, GM_getValue, GM_setValue, GM_addValueChangeListener, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab */
+/* global GM_cookie, GM_getValue, GM_setValue, GM_addValueChangeListener, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab, unsafeWindow */
 
 /* ==UserConfig==
 Config:
@@ -50,9 +51,9 @@ Config:
         type: checkbox
         default: true
     accountLabel:
-        title: 账号备注（显示在通知里）
+        title: 账号备注
         type: text
-        description: 填写邮箱或账号名；留空则通知显示「未获取到」
+        description: 通知中显示的账号名，留空则显示「未获取到」
     lock:
         title: 锁定国区（非大陆IP自动停止）
         type: checkbox
@@ -82,7 +83,19 @@ Tasks:
         type: checkbox
         default: true
     promos:
-        title: 活动卡片（含打卡）
+        title: 活动卡片
+        type: checkbox
+        default: true
+    punchcard:
+        title: 打卡/任务卡片
+        type: checkbox
+        default: true
+    punchcardUrl:
+        title: 打卡页地址（可选，留空自动查找）
+        type: text
+        description: 打卡页地址每月会变，一般留空即可；脚本会自动查找本月入口
+    punchcardAutoOpen:
+        title: 打卡：自动打开页面点击（后台点击无效）
         type: checkbox
         default: true
     quiz:
@@ -127,11 +140,57 @@ Notice:
         title: Telegram Bot Token
         type: text
         password: true
-        description: 例如 123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        description: 通过 @BotFather 创建机器人后获取，例如 123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     telegramChatId:
         title: Telegram Chat ID
         type: text
-        description: 先给机器人发一条消息，再从 @userinfobot 获取数字 ID
+        description: 先给机器人发一条消息，再通过 @userinfobot 获取数字 ID
+Webhook:
+    enabled:
+        title: 启用自定义 Webhook
+        type: switch
+        default: false
+    url:
+        title: Webhook 地址
+        type: text
+        description: '接收通知的完整 URL，支持 {{content_url}} 等占位符'
+    method:
+        title: 请求方法
+        type: select
+        default: POST
+        values: [POST, GET, PUT]
+    contentType:
+        title: 请求格式
+        type: select
+        default: application/json
+        values: [application/json, application/x-www-form-urlencoded]
+    authType:
+        title: 认证方式
+        type: select
+        default: 不使用
+        values: [不使用, 密码登录, 账号登录, 令牌]
+    username:
+        title: 账号
+        type: text
+        description: 认证方式选「账号登录」时填写
+    password:
+        title: 密码
+        type: text
+        password: true
+        description: 认证方式选「密码登录」或「账号登录」时填写
+    token:
+        title: 令牌
+        type: text
+        password: true
+        description: 认证方式选「令牌」时填写，作为 Bearer Token 发送
+    headers:
+        title: 自定义请求头（JSON）
+        type: textarea
+        description: '例如 {"X-Custom": "value"}，留空则不添加'
+    body:
+        title: 自定义请求体
+        type: textarea
+        description: '支持 {{title}}、{{content}}、{{time}}、{{script}}；留空则发送默认 JSON'
 ==/UserConfig== */
 
 (function() {
@@ -404,6 +463,43 @@ Notice:
         saveTodayStats(stats) {
             GM_setValue("Config.todayStats", stats);
         },
+        // 今日已点击的打卡子任务链接（按日期自动重置）
+        getPunchCardClicked(date = Utils.getTodayNum()) {
+            const data = GM_getValue("Config.punchCardClicked", null);
+            if (!data || data.date !== date || !Array.isArray(data.urls)) {
+                return { date, urls: [] };
+            }
+            return data;
+        },
+        // 从任意文本（页面源码、RSC 数据、接口响应）中提取本月打卡页地址
+        extractPunchUrl(text) {
+            if (!text || !/punchcard|monthlypc/i.test(text)) return "";
+            const clean = String(text)
+                .replace(/\\\//g, "/")
+                .replace(/\\u002F/gi, "/")
+                .replace(/\\"/g, '"')
+                .replace(/&amp;/g, "&");
+
+            // 1) 完整路径
+            const full = clean.match(/(?:https?:\/\/rewards\.bing\.com)?\/earn\/quest\/[A-Za-z0-9_-]+/i);
+            if (full && /punchcard|monthlypc/i.test(full[0])) {
+                return full[0].startsWith("http") ? full[0] : `https://rewards.bing.com${full[0]}`;
+            }
+
+            // 2) questId 字段
+            const questIds = [...clean.matchAll(/"questId"\s*:\s*"([^"]+)"/gi)].map(m => m[1]);
+            const monthlyQuest = questIds.find(id => /punchcard|monthlypc/i.test(id));
+            if (monthlyQuest) return `https://rewards.bing.com/earn/quest/${monthlyQuest}`;
+
+            // 3) 下划线分隔的任务标识符（quest ID 通常形如 ENWW_pcparent_FY27_BingMonthlyPC_Nov_punchcard）
+            const ids = clean.match(/[A-Za-z0-9]+(?:_[A-Za-z0-9]+){2,}/g) || [];
+            const idMatch = ids.find(id =>
+                id.length >= 12 && /[A-Z]/.test(id) && /punchcard|monthlypc/i.test(id)
+            );
+            if (idMatch) return `https://rewards.bing.com/earn/quest/${idMatch}`;
+
+            return "";
+        },
         addTodayWarning(msg) {
             const stats = this.getTodayStats();
             if (!stats.warnings.includes(msg)) {
@@ -437,39 +533,142 @@ Notice:
                 lines.push(`📅 每日活动: 已点击 ${dailySetCount} 个`);
             }
 
+            const punchCard = this.getPunchCardClicked(today);
+            if (punchCard.urls.length > 0) {
+                lines.push(`🎯 打卡任务: 已点击 ${punchCard.urls.length} 个`);
+            }
+
             lines.push(...stats.warnings);
             return lines;
         },
 
         // 发送webhook通知
         async sendWebhook() {
-            await Promise.all(Webhooks.map(async (i) => {
-                if (!i.key) return;
-                const safeKey = String(i.key).trim();
-                if (i.type === "telegram" && !i.chatId) return;
-                const targetUrl = i.type === "telegram"
-                    ? `${i.url}${safeKey}/sendMessage`
-                    : (safeKey.startsWith("http") ? safeKey : i.url + safeKey);
-                try {
-                    const result = await this.xhr({
-                        method: "POST",
-                        url: targetUrl,
-                        headers: {
-                            "content-type": "application/json; charset=UTF-8",
-                        },
-                        data: JSON.stringify(i.msg),
-                    });
-                    if (result) GM_log(`🔵 「${i.name}」消息推送完成`);
-                } catch (e) {
-                    GM_log(`🔴 「${i.name}」消息推送出错: ${e.message}`);
-                }
-            }));
+            await Promise.all([
+                ...Webhooks.map(async (i) => {
+                    if (!i.key) return;
+                    const safeKey = String(i.key).trim();
+                    if (i.type === "telegram" && !i.chatId) return;
+                    const targetUrl = i.type === "telegram"
+                        ? `${i.url}${safeKey}/sendMessage`
+                        : (safeKey.startsWith("http") ? safeKey : i.url + safeKey);
+                    try {
+                        const result = await this.xhr({
+                            method: "POST",
+                            url: targetUrl,
+                            headers: {
+                                "content-type": "application/json; charset=UTF-8",
+                            },
+                            data: JSON.stringify(i.msg),
+                        });
+                        if (result) GM_log(`🔵 「${i.name}」消息推送完成`);
+                    } catch (e) {
+                        GM_log(`🔴 「${i.name}」消息推送出错: ${e.message}`);
+                    }
+                }),
+                this.sendCustomWebhook()
+            ]);
         },
 
-        // 封装 GM_xmlhttpRequest，15秒超时，支持重定向
-        xhr(options) {
+        // 发送自定义 Webhook
+        async sendCustomWebhook() {
+            if (!GM_getValue("Webhook.enabled", false)) return;
+            const rawUrl = String(GM_getValue("Webhook.url", "")).trim();
+            if (!rawUrl) return;
+
+            const method = String(GM_getValue("Webhook.method", "POST")).toUpperCase();
+            const contentType = String(GM_getValue("Webhook.contentType", "application/json"));
+            const authType = String(GM_getValue("Webhook.authType", "不使用"));
+            const username = String(GM_getValue("Webhook.username", ""));
+            const password = String(GM_getValue("Webhook.password", ""));
+            const token = String(GM_getValue("Webhook.token", ""));
+            const title = GM_info.script.name;
+            const content = RewardsAuto.state.sendMSG;
+            const time = new Date().toLocaleString();
+
+            const jsonEscape = (s) => JSON.stringify(String(s)).slice(1, -1);
+            const fill = (s) => String(s).replace(
+                /\{\{(title|content|time|script|title_json|content_json|time_json|content_url)\}\}/g,
+                (match, key) => {
+                    switch (key) {
+                        case "title": return title;
+                        case "content": return content;
+                        case "time": return time;
+                        case "script": return title;
+                        case "title_json": return jsonEscape(title);
+                        case "content_json": return jsonEscape(content);
+                        case "time_json": return jsonEscape(time);
+                        case "content_url": return encodeURIComponent(content);
+                        default: return match;
+                    }
+                }
+            );
+
+            const url = fill(rawUrl);
+
+            // 请求头：默认 content-type，再合并用户自定义 JSON
+            const headers = { "content-type": `${contentType}; charset=UTF-8` };
+            const rawHeaders = String(GM_getValue("Webhook.headers", "")).trim();
+            if (rawHeaders) {
+                try {
+                    const extra = JSON.parse(rawHeaders);
+                    if (extra && typeof extra === "object" && !Array.isArray(extra)) {
+                        for (const [key, value] of Object.entries(extra)) {
+                            const name = String(key).toLowerCase();
+                            if (["__proto__", "constructor", "prototype"].includes(name)) continue;
+                            headers[name] = value;
+                        }
+                    }
+                } catch (e) {
+                    GM_log(`🔴 「自定义 Webhook」请求头 JSON 解析失败: ${e.message}`);
+                }
+            }
+
+            // 认证：密码登录 / 账号登录 / 令牌
+            const toBase64 = (s) => {
+                try {
+                    return btoa(s);
+                } catch {
+                    const bytes = new TextEncoder().encode(s);
+                    let binary = "";
+                    for (const b of bytes) binary += String.fromCharCode(b);
+                    return btoa(binary);
+                }
+            };
+            if (authType === "账号登录" && username) {
+                headers["authorization"] = `Basic ${toBase64(`${username}:${password}`)}`;
+            } else if (authType === "密码登录" && password) {
+                headers["authorization"] = `Basic ${toBase64(`:${password}`)}`;
+            } else if (authType === "令牌" && token) {
+                headers["authorization"] = `Bearer ${token}`;
+            }
+
+            // 请求体：默认 JSON，支持自定义模板
+            let data;
+            if (method !== "GET") {
+                const customBody = String(GM_getValue("Webhook.body", "")).trim();
+                if (customBody) {
+                    data = fill(customBody);
+                } else if (contentType === "application/x-www-form-urlencoded") {
+                    data = `title=${encodeURIComponent(title)}&content=${encodeURIComponent(content)}&time=${encodeURIComponent(time)}&script=${encodeURIComponent(title)}`;
+                } else {
+                    data = JSON.stringify({ title, content, time, script: title });
+                }
+            }
+
+            try {
+                const result = await this.xhr({ method, url, headers, data });
+                if (result) GM_log("🔵 「自定义 Webhook」消息推送完成");
+            } catch (e) {
+                GM_log(`🔴 「自定义 Webhook」消息推送出错: ${e.message}`);
+            }
+        },
+
+        // 封装 GM_xmlhttpRequest，15秒超时；GET 自动跟随重定向
+        xhr(options, _redirects = 0) {
             return new Promise((resolve, reject) => {
                 const start = Date.now();
+                const isGetLike = !options.method || options.method.toUpperCase() === "GET";
                 GM_xmlhttpRequest({
                     ...options,
                     timeout: 15000,
@@ -479,6 +678,13 @@ Notice:
                             resolve(res.responseText);
                         } else if ([301, 302, 307, 308].includes(res.status)) {
                             const match = res.responseHeaders?.match(/Location:\s*(.*?)\s*\r?\n/i);
+                            if (isGetLike && match && _redirects < 5) {
+                                try {
+                                    const nextUrl = new URL(match[1], options.url).toString();
+                                    resolve(this.xhr({ ...options, url: nextUrl }, _redirects + 1));
+                                    return;
+                                } catch (_) {}
+                            }
                             resolve(match ? match[1] : false);
                         } else {
                             reject(new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
@@ -1921,6 +2127,98 @@ Notice:
             }
         },
 
+        // 打卡/任务卡片：后台只负责按需打开打卡入口，查找和点击都由页面脚本完成。
+        // 打卡页地址每月都会变，因此不需要用户手填：页面脚本会从 /earn 自动找本月入口。
+        async doPunchCard() {
+            if (!GM_getValue("Tasks.punchcard", true)) return;
+            const today = RewardsAuto.state.dateNowNum;
+
+            // 脚本更新后清掉当天旧的打卡标记，避免旧版本留下的「今日已处理」挡住新逻辑
+            const logicVer = (typeof GM_info !== "undefined" && GM_info.script?.version) || "unknown";
+            if (GM_getValue("Config.punchCardLogicVersion", "") !== logicVer) {
+                GM_setValue("Config.punchCardOpenDate", 0);
+                GM_setValue("Config.punchCardBgDone", 0);
+                GM_setValue("Config.punchCardLogicVersion", logicVer);
+            }
+
+            const doneKey = "Config.punchCardBgDone";
+            if (GM_getValue(doneKey, 0) === today) {
+                Utils.log("📅", "打卡任务今日已处理");
+                return;
+            }
+
+            Utils.log("📅", "检查打卡任务...");
+
+            if (!GM_getValue("Tasks.punchcardAutoOpen", true)) {
+                Utils.log("📅", "未开启自动打开页面；可在脚本菜单「🎯 处理打卡任务」中手动处理");
+                GM_setValue(doneKey, today);
+                return;
+            }
+            if (GM_getValue("Config.punchCardOpenDate", 0) === today) {
+                Utils.log("📅", "今日已自动打开过打卡页");
+                GM_setValue(doneKey, today);
+                return;
+            }
+
+            // 优先使用今天已捕获/自动发现的地址；手填地址只作为兜底
+            const configured = String(GM_getValue("Tasks.punchcardUrl", "")).trim();
+            // 手填地址如果带着上个月的月份标记（如 ..._BingMonthlyPC_Oct_punchcard），直接忽略
+            const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+            const configuredMonth = configured.match(/BingMonthlyPC[_-]([A-Za-z]{3})/i);
+            const configuredStale = !!configuredMonth &&
+                configuredMonth[1].toLowerCase() !== monthNames[new Date().getMonth()];
+            const configuredUrl = configuredStale ? "" : configured;
+            if (configuredStale) {
+                Utils.log("📅", "手动填写的打卡地址是上个月的，已忽略并自动查找本月入口");
+            }
+            let discovered = GM_getValue("Config.punchCardUrlDate", 0) === today
+                ? String(GM_getValue("Config.punchCardUrl", "")).trim()
+                : "";
+            // 旧版本可能把普通任务页存成打卡地址，这里只认带 punchcard/monthlypc 的链接
+            if (discovered && !/punchcard|monthlypc/i.test(discovered)) {
+                discovered = "";
+            }
+
+            // 没有今天的地址时，先在后台直接读取 /earn、/dashboard 页面源码查找本月入口
+            if (!discovered) {
+                for (const pageUrl of ["https://rewards.bing.com/earn", "https://rewards.bing.com/dashboard"]) {
+                    try {
+                        const html = await Utils.xhr({ url: pageUrl });
+                        const found = Utils.extractPunchUrl(html);
+                        if (found) {
+                            GM_setValue("Config.punchCardUrl", found.split("?")[0]);
+                            GM_setValue("Config.punchCardUrlDate", today);
+                            discovered = found;
+                            Utils.log("📅", `从页面源码发现本月打卡页: ${found}`);
+                            break;
+                        }
+                    } catch (e) {
+                        Utils.log("🟡", `读取 ${pageUrl} 查找打卡入口失败: ${e.message}`);
+                    }
+                }
+            }
+
+            const baseUrl = discovered || configuredUrl || "https://rewards.bing.com/earn";
+            if (!discovered) {
+                Utils.log("📅", configuredUrl
+                    ? "后台未发现本月入口，使用手动填写的打卡地址"
+                    : "后台页面源码未找到打卡入口，改由页面脚本在 /earn 中继续查找");
+            }
+            const openUrl = `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}bingrewards_punch=1&bingrewards_autoclose=1`;
+            try {
+                const tab = GM_openInTab(openUrl, { active: false, insert: true, setParent: true });
+                GM_setValue("Config.punchCardOpenDate", today);
+                GM_setValue(doneKey, today);
+                Utils.log("📅", "已在后台标签页打开打卡入口，由页面脚本点击任务");
+                // 页面脚本完成后会尝试自行关闭；这里做兜底关闭
+                setTimeout(() => {
+                    try { tab?.close?.(); } catch (_) {}
+                }, 600000);
+            } catch (e) {
+                Utils.log("🟡", `打开打卡入口失败: ${e.message}`);
+            }
+        },
+
         async clickDailySetLinks(processedIds, processed) {
             let clickCount = 0;
 
@@ -2019,6 +2317,7 @@ Notice:
             const details = (info?.todayDetails || [])
                 .map(item => `${item.title}:${item.points}:${item.max || 0}`)
                 .sort();
+            const punchCard = Utils.getPunchCardClicked(today);
 
             return JSON.stringify({
                 signDate: this.signDate,
@@ -2030,7 +2329,8 @@ Notice:
                 pcProgress: info?.pc?.progress ?? null,
                 mobileProgress: info?.mobile?.progress ?? null,
                 details,
-                todayProcessed
+                todayProcessed,
+                punchCardCount: punchCard.urls.length
             });
         },
 
@@ -2097,6 +2397,14 @@ Notice:
                     await this.doDailySet();
                 } catch (e) {
                     Utils.log("🟡", `每日活动执行异常: ${e.message}`);
+                }
+
+                Utils.log("🎯", "开始执行打卡任务...");
+                await Utils.randomDelay();
+                try {
+                    await this.doPunchCard();
+                } catch (e) {
+                    Utils.log("🟡", `打卡任务执行异常: ${e.message}`);
                 }
 
                 const currentSnapshot = await this.getTaskScanSnapshot();
@@ -2225,6 +2533,29 @@ Notice:
         }
     };
 
+    // 自动打卡标签页的上下文标记（URL 参数 + sessionStorage，防止页面跳转后丢失）
+    const isAutoPunchContext = () => {
+        try {
+            if (typeof location !== "undefined" && new URLSearchParams(location.search).get("bingrewards_punch") === "1") return true;
+            if (typeof sessionStorage !== "undefined" && sessionStorage.getItem("bingrewards_punch") === "1") return true;
+        } catch (_) {}
+        return false;
+    };
+    const shouldAutoCloseContext = () => {
+        try {
+            if (typeof location !== "undefined" && new URLSearchParams(location.search).get("bingrewards_autoclose") === "1") return true;
+            if (typeof sessionStorage !== "undefined" && sessionStorage.getItem("bingrewards_autoclose") === "1") return true;
+        } catch (_) {}
+        return false;
+    };
+    const clearAutoPunchContext = () => {
+        try {
+            sessionStorage.removeItem("bingrewards_punch");
+            sessionStorage.removeItem("bingrewards_autoclose");
+            sessionStorage.removeItem("bingrewards_tried_dashboard");
+        } catch (_) {}
+    };
+
     if (typeof location !== "undefined" && typeof document !== "undefined" && location.hostname === "rewards.bing.com") {
         const punchCardSelectors = [
             "a[href*='punchcard']", "a[href*='quest']",
@@ -2235,89 +2566,207 @@ Notice:
             "a[data-bi-id][href*='earn']",
         ];
         const textPatterns = ["盗贼之海", "五月亮点来袭", "每日活动", "Daily Set", "限时活动", "特别活动"];
-        
-        const detailTextPatterns = [
-            "关注赛事", "访问网站", "开始搜索",
-            "发现", "探索", "获取", "Learn more", "了解更多",
-            "Start", "Begin", "Watch", "View", "Check",
-            "立即开始", "立即参与", "立即前往", "立即访问",
-            "参加活动", "参与活动", "前往活动"
-        ];
+
+        // 从任意文本（页面源码、RSC 数据、接口响应）中提取本月打卡页地址
+        const extractPunchUrl = (text) => Utils.extractPunchUrl(text);
+
+        const savePunchUrl = (url) => {
+            if (!url) return;
+            GM_setValue("Config.punchCardUrl", url.split("?")[0]);
+            GM_setValue("Config.punchCardUrlDate", Utils.getTodayNum());
+            console.log(`[Rewards Auto] 捕获打卡页地址: ${url}`);
+        };
+
+        // 自动模式：拦截页面请求，捕获客户端异步加载的打卡地址
+        const installPunchCapture = () => {
+            if (!isAutoPunchContext()) return;
+            const pw = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+            try {
+                if (pw.fetch && !pw.__bingRewardsPunchHooked) {
+                    const origFetch = pw.fetch;
+                    pw.fetch = function(...args) {
+                        const p = origFetch.apply(this, args);
+                        p.then(res => {
+                            try {
+                                res.clone().text().then(text => savePunchUrl(extractPunchUrl(text))).catch(() => {});
+                            } catch (_) {}
+                        }).catch(() => {});
+                        return p;
+                    };
+                    pw.__bingRewardsPunchHooked = true;
+                }
+            } catch (_) {}
+
+            try {
+                const XHR = pw.XMLHttpRequest;
+                if (XHR && !XHR.prototype.__bingRewardsPunchHooked) {
+                    const origSend = XHR.prototype.send;
+                    XHR.prototype.send = function(...args) {
+                        this.addEventListener("load", () => {
+                            try {
+                                if (typeof this.responseText === "string") {
+                                    savePunchUrl(extractPunchUrl(this.responseText));
+                                }
+                            } catch (_) {}
+                        });
+                        return origSend.apply(this, args);
+                    };
+                    XHR.prototype.__bingRewardsPunchHooked = true;
+                }
+            } catch (_) {}
+        };
+        installPunchCapture();
 
         const clickDetailTasks = async () => {
             const today = Utils.getTodayNum();
-            const detailStateKey = "Config.punchCardDetailState";
-            const detailDateKey = "Config.punchCardDetailDate";
-            const savedDate = GM_getValue(detailDateKey, 0);
-            let currentDetailState = 0;
-            
-            if (savedDate === today) {
-                currentDetailState = GM_getValue(detailStateKey, 0);
-            } else {
-                GM_setValue(detailStateKey, 0);
-                GM_setValue(detailDateKey, today);
+            const isAutoPunchTab = isAutoPunchContext();
+            const shouldAutoClose = shouldAutoCloseContext();
+
+            // 下载/安装类任务不做：脚本不安装任何应用；同时排除兑换、登录等非任务按钮
+            const isSkippedTask = (btn) => {
+                const href = btn.href || "";
+                return /microsoft-store|apps\.microsoft|aka\.ms|\/download|\/install|\/redeem|login\.live|account\.microsoft|rewardspanel/i.test(href);
+            };
+
+            const collectButtons = () => {
+                const enabled = (el) =>
+                    el.disabled !== true &&
+                    el.getAttribute("aria-disabled") !== "true" &&
+                    el.getAttribute("data-disabled") !== "true";
+
+                // 1) 旧版/常见结构：带 data-rac 的任务按钮
+                const primary = [...document.querySelectorAll(
+                    "a[data-rac][target='_blank'], button[data-rac], [role='button'][data-rac]"
+                )].filter(el => enabled(el) && !isSkippedTask(el));
+                if (primary.length > 0) return primary;
+
+                // 2) data-rac 名称本身像任务的元素
+                const taskRac = [...document.querySelectorAll("[data-rac]")]
+                    .filter(el => {
+                        if (!enabled(el) || isSkippedTask(el)) return false;
+                        const rac = el.getAttribute("data-rac") || "";
+                        if (!/task|quest|punch|check-?in|complete|offer/i.test(rac)) return false;
+                        const href = el.href || "";
+                        if (/\/(?:dashboard|earn)(?:[?#]|$)/i.test(href)) return false;
+                        if (/\/earn\/quest\//i.test(href)) return false;
+                        return true;
+                    });
+                if (taskRac.length > 0) return taskRac;
+
+                // 3) 新版结构：所有最内层可点击的 data-rac 元素，排除页面导航/打卡入口
+                const rac = [...document.querySelectorAll("[data-rac]")]
+                    .filter(el => {
+                        if (!enabled(el) || isSkippedTask(el)) return false;
+                        if (el.querySelector("[data-rac]")) return false;
+                        const href = el.href || "";
+                        if (/\/(?:dashboard|earn)(?:[?#]|$)/i.test(href)) return false;
+                        if (/\/earn\/quest\//i.test(href)) return false;
+                        return true;
+                    });
+                if (rac.length > 0) return rac;
+
+                // 4) 最后兜底：文字像任务动作的按钮
+                return [...document.querySelectorAll("button, [role='button'], a[href]")]
+                    .filter(el => {
+                        if (!enabled(el) || isSkippedTask(el)) return false;
+                        const text = (el.textContent || "").trim().replace(/\s+/g, " ");
+                        if (!text || text.length > 40) return false;
+                        return /开始|前往|访问|搜索|查看|参与|立即|start|go|visit|search|view|play|learn/i.test(text);
+                    });
+            };
+
+            // href + 按钮文字 + data-rac 作为当天去重标识
+            const taskKey = (btn) => {
+                const href = btn.href || "";
+                const text = (btn.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80);
+                const rac = btn.getAttribute("data-rac") || btn.getAttribute("data-bi-id") || btn.id || "";
+                return `${href}#${text}#${rac}`;
+            };
+
+            // 防止多个打卡页面同时点击（例如手动打开页面时后台又自动打开一个）
+            const lockKey = "Config.punchCardRunning";
+            const lockTime = Number(GM_getValue(lockKey, 0)) || 0;
+            if (Date.now() - lockTime < 5 * 60 * 1000) {
+                console.log("[Rewards Auto] 另一个打卡页面正在处理，跳过本次");
+                return 0;
             }
-            
-            if (currentDetailState >= 5) {
-                console.log("[Rewards Auto] 详情页任务今日已全部点击完成");
-                return true;
+            GM_setValue(lockKey, Date.now());
+
+            console.log("[Rewards Auto] 开始扫描打卡任务按钮...");
+            // 等待页面渲染出任务按钮（最多 30 秒）
+            for (let i = 0; i < 30 && collectButtons().length === 0; i++) {
+                await Utils.delay(1000);
             }
-            
-            console.log(`[Rewards Auto] 开始执行详情页任务点击，当前状态: ${currentDetailState}/5`);
-            // 【防封号】操作前随机延迟 2-4 秒
-            await Utils.randomDelay(3000, 8000);
-            
-            // 查找可用的任务按钮
-            const enabledButtons = document.querySelectorAll(
-                "a[data-rac][target='_blank']:not([aria-disabled='true']):not([data-disabled='true'])"
-            );
-            const disabledButtons = document.querySelectorAll(
-                "a[data-rac][target='_blank'][aria-disabled='true'][data-disabled='true']"
-            );
-            
-            console.log(`[Rewards Auto] 找到 ${enabledButtons.length} 个可用按钮，${disabledButtons.length} 个禁用按钮`);
-            
-            let clickableButton = null;
-            
-            // 优先查找包含特定文本的按钮
-            for (const btn of enabledButtons) {
-                const text = btn.textContent || "";
-                const ariaLabel = btn.getAttribute("aria-label") || "";
-                if (detailTextPatterns.some(pattern => text.includes(pattern) || ariaLabel.includes(pattern))) {
-                    clickableButton = btn;
+            if (collectButtons().length === 0) {
+                const racEls = [...document.querySelectorAll("[data-rac]")];
+                console.log(`[Rewards Auto] 未找到可点击任务按钮（页面 data-rac 元素共 ${racEls.length} 个）`);
+                const samples = racEls.slice(0, 30).map(el => {
+                    const text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 20);
+                    return `${el.tagName.toLowerCase()}[data-rac="${el.getAttribute("data-rac")}"]${text ? `(${text})` : ""}`;
+                });
+                console.log(`[Rewards Auto] data-rac 样例: ${samples.join(" | ") || "(无)"}`);
+            }
+
+            let totalClicked = 0;
+            // 最多 3 轮：部分任务完成后会解锁新任务
+            for (let pass = 1; pass <= 3; pass++) {
+                const clicked = Utils.getPunchCardClicked(today);
+                const clickedKeys = new Set(clicked.urls);
+                const buttons = collectButtons().filter(btn => !clickedKeys.has(taskKey(btn)));
+                if (buttons.length === 0) {
+                    if (pass === 1) console.log("[Rewards Auto] 没有可点击的打卡任务（可能已完成）");
                     break;
                 }
+
+                console.log(`[Rewards Auto] 第 ${pass} 轮发现 ${buttons.length} 个可点击任务`);
+                for (const btn of buttons) {
+                    console.log(`[Rewards Auto] 任务按钮: "${(btn.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40)}" -> ${btn.href || "(button)"}`);
+                }
+                for (const btn of buttons) {
+                    // 页面可能重渲染，点击前重新查找同一个按钮
+                    const key = taskKey(btn);
+                    const current = collectButtons().find(item => taskKey(item) === key);
+                    if (!current) continue;
+
+                    const text = (current.textContent || "").trim().replace(/\s+/g, " ").slice(0, 50) || "未知任务";
+                    console.log(`[Rewards Auto] 点击任务: ${text}`);
+
+                    // 【防封号】点击前后随机延迟
+                    await Utils.randomDelay(3000, 8000);
+                    try {
+                        current.click();
+                        totalClicked++;
+                        const latest = Utils.getPunchCardClicked(today);
+                        if (!latest.urls.includes(key)) {
+                            latest.urls.push(key);
+                            GM_setValue("Config.punchCardClicked", latest);
+                        }
+                    } catch (e) {
+                        console.error(`[Rewards Auto] 点击任务失败: ${e.message}`);
+                    }
+                    await Utils.randomDelay(3000, 8000);
+                }
+
+                // 等待页面更新，再扫描是否有新解锁的任务
+                await Utils.delay(5000);
             }
-            
-            // 如果没有找到特定文本的按钮，使用第一个可用按钮
-            if (!clickableButton && enabledButtons.length > 0) {
-                clickableButton = enabledButtons[0];
+
+            if (totalClicked > 0) {
+                console.log(`[Rewards Auto] 打卡任务本轮共点击 ${totalClicked} 个`);
+                GM_setValue("Config.punchCardBgDone", today);
+            } else {
+                console.log("[Rewards Auto] 本轮没有点击任何打卡任务");
             }
-            
-            if (!clickableButton) {
-                console.log("[Rewards Auto] 未找到可用的任务按钮，所有任务可能已完成或需要等待解锁");
-                return true;
+
+            GM_setValue(lockKey, 0);
+            clearAutoPunchContext();
+
+            // 自动打开的后台标签页在完成后自行关闭
+            if (isAutoPunchTab && shouldAutoClose) {
+                setTimeout(() => { try { window.close(); } catch (_) {} }, 5000);
             }
-            
-            const buttonText = clickableButton.textContent || "未知任务";
-            const ariaLabel = clickableButton.getAttribute("aria-label") || buttonText;
-            console.log(`[Rewards Auto] 准备点击任务按钮: "${buttonText}"`);
-            
-            // 【防封号】点击前随机延迟 3-8 秒
-            await Utils.randomDelay(3000, 8000);
-            
-            try {
-                clickableButton.click();
-                console.log(`[Rewards Auto] 已点击任务按钮: "${buttonText}"`);
-                GM_setValue(detailStateKey, currentDetailState + 1);
-                GM_setValue(detailDateKey, today);
-                // 【防封号】点击后随机延迟 2-4 秒
-                await Utils.randomDelay(3000, 8000);
-                return true;
-            } catch (clickError) {
-                console.error(`[Rewards Auto] 点击任务按钮失败: ${clickError.message}`);
-                return false;
-            }
+            return totalClicked;
         };
 
         const clickPunchCards = async (depth = 0) => {
@@ -2373,19 +2822,115 @@ Notice:
             }
         };
 
+        // 在 /earn 或 /dashboard 页面自动查找本月的打卡入口（地址每月变化，不能写死）
+        const findPunchCardUrl = async () => {
+            for (let i = 0; i < 30; i++) {
+                // 1) 网络拦截已经捕获到的地址
+                const captured = GM_getValue("Config.punchCardUrlDate", 0) === Utils.getTodayNum()
+                    ? String(GM_getValue("Config.punchCardUrl", "")).trim()
+                    : "";
+                if (captured && /\/earn\/quest\//.test(captured) && /punchcard|monthlypc/i.test(captured)) return captured;
+
+                // 2) 页面上已渲染的 quest 链接
+                const links = [...document.querySelectorAll("a[href*='quest']")];
+                const punchLink = links.find(a => /punchcard|monthlypc/i.test(a.href))
+                    || links.find(a => /punchcard|打卡|本月任务|月度任务/i.test(a.textContent || ""));
+                if (punchLink) return punchLink.href;
+
+                // 3) 页面源码 / RSC 数据里的地址或 questId
+                if (i % 2 === 0) {
+                    const url = extractPunchUrl(document.documentElement.innerHTML);
+                    if (url) return url;
+                }
+                await Utils.delay(1000);
+            }
+            return "";
+        };
+
         const startPunchCards = () => {
             setTimeout(async () => {
+                const isAutoPunchTab = isAutoPunchContext();
+                const shouldAutoClose = shouldAutoCloseContext();
                 const path = location.pathname;
+
                 if (path.includes("/earn/quest/") || path.includes("punchcard")) {
-                    console.log("[Rewards Auto] 检测到打卡详情页，开始执行任务点击...");
-                    clickDetailTasks();
+                    // 只有确实是本月打卡页才记录地址，避免普通任务页覆盖打卡地址
+                    if (/punchcard|monthlypc/i.test(location.href)) {
+                        GM_setValue("Config.punchCardUrl", location.href.split("?")[0]);
+                        GM_setValue("Config.punchCardUrlDate", Utils.getTodayNum());
+                    }
+                    console.log("[Rewards Auto] 检测到任务详情页，开始执行任务点击...");
+                    await clickDetailTasks();
+                } else if (isAutoPunchTab) {
+                    console.log("[Rewards Auto] 自动模式：正在查找本月打卡入口...");
+                    const punchUrl = await findPunchCardUrl();
+                    if (punchUrl) {
+                        savePunchUrl(punchUrl);
+                        console.log(`[Rewards Auto] 找到打卡页，正在跳转: ${punchUrl}`);
+                        // 用 sessionStorage 记住自动模式，防止跳转后参数丢失
+                        try {
+                            sessionStorage.setItem("bingrewards_punch", "1");
+                            if (shouldAutoClose) sessionStorage.setItem("bingrewards_autoclose", "1");
+                        } catch (_) {}
+                        const nextUrl = `${punchUrl}${punchUrl.includes("?") ? "&" : "?"}bingrewards_punch=1${shouldAutoClose ? "&bingrewards_autoclose=1" : ""}`;
+                        location.href = nextUrl;
+                        return;
+                    }
+
+                    // 兜底 1：点击文字含"打卡/本月任务"的卡片，让页面自己跳转
+                    const cardText = (el) => (el.textContent || "").trim().replace(/\s+/g, " ");
+                    const cardScore = (text) => {
+                        let score = 0;
+                        if (/punchcard|打卡/i.test(text)) score += 3;
+                        if (/本月|月度|monthly/i.test(text)) score += 2;
+                        if (/任务/i.test(text)) score += 1;
+                        return score;
+                    };
+                    const candidates = [...document.querySelectorAll("a, button, [role='button'], [data-rac]")];
+                    const card = candidates
+                        .filter(el => {
+                            const text = cardText(el);
+                            return text.length > 0 && text.length <= 60 && cardScore(text) > 0;
+                        })
+                        .sort((a, b) => cardScore(cardText(b)) - cardScore(cardText(a)) || cardText(a).length - cardText(b).length)[0];
+                    if (card) {
+                        console.log(`[Rewards Auto] 未提取到地址，尝试点击打卡卡片: "${(card.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40)}"`);
+                        try {
+                            sessionStorage.setItem("bingrewards_punch", "1");
+                            if (shouldAutoClose) sessionStorage.setItem("bingrewards_autoclose", "1");
+                        } catch (_) {}
+                        card.click();
+                        return;
+                    }
+
+                    // 兜底 2：/earn 没有就去 /dashboard 再找一次
+                    let triedDashboard = false;
+                    try { triedDashboard = sessionStorage.getItem("bingrewards_tried_dashboard") === "1"; } catch (_) {}
+                    if (!triedDashboard && !path.includes("/dashboard")) {
+                        try { sessionStorage.setItem("bingrewards_tried_dashboard", "1"); } catch (_) {}
+                        console.log("[Rewards Auto] /earn 未找到，转到 /dashboard 继续查找...");
+                        location.href = `https://rewards.bing.com/dashboard?bingrewards_punch=1${shouldAutoClose ? "&bingrewards_autoclose=1" : ""}`;
+                        return;
+                    }
+
+                    // 诊断信息，便于定位页面结构
+                    const rac = [...document.querySelectorAll("[data-rac]")].map(el => el.getAttribute("data-rac")).filter(Boolean);
+                    console.log(`[Rewards Auto] 未找到本月打卡入口（quest 链接 ${document.querySelectorAll("a[href*='quest']").length} 个，data-rac ${rac.length} 个，页面含 punchcard=${/punchcard|monthlypc/i.test(document.documentElement.innerHTML)}）`);
+                    console.log(`[Rewards Auto] data-rac 样例: ${rac.slice(0, 20).join(" | ") || "(无)"}`);
+                    if (shouldAutoClose) {
+                        setTimeout(() => { try { window.close(); } catch (_) {} }, 3000);
+                    }
+                    return;
                 } else {
                     console.log("[Rewards Auto] 检测到奖励主页，开始执行卡片点击...");
-                    clickPunchCards();
+                    await clickPunchCards();
                 }
 
-                        console.log("[Rewards Auto] 开始执行每日活动点击...");
-                await TaskManager.doDailySet();
+                // 自动打开的打卡页只处理打卡，不再触发每日活动等其他点击
+                if (!isAutoPunchTab) {
+                    console.log("[Rewards Auto] 开始执行每日活动点击...");
+                    await TaskManager.doDailySet();
+                }
             }, 3000); // 延迟 3 秒等待页面渲染
         };
         
@@ -2424,6 +2969,20 @@ Notice:
         GM_log("🚀 已提交手动运行请求，后台任务将立即开始");
     });
 
+    GM_registerMenuCommand("🎯 处理打卡任务", () => {
+        const today = Utils.getTodayNum();
+        const configured = String(GM_getValue("Tasks.punchcardUrl", "")).trim();
+        const discoveredRaw = GM_getValue("Config.punchCardUrlDate", 0) === today
+            ? String(GM_getValue("Config.punchCardUrl", "")).trim()
+            : "";
+        // 只认带 punchcard/monthlypc 的自动发现地址，避免旧版本存下的普通任务页
+        const discovered = /punchcard|monthlypc/i.test(discoveredRaw) ? discoveredRaw : "";
+        // 没有已知地址时打开 /earn，由页面脚本自动查找本月打卡入口
+        const url = discovered || configured || "https://rewards.bing.com/earn";
+        const openUrl = `${url}${url.includes("?") ? "&" : "?"}bingrewards_punch=1`;
+        GM_openInTab(openUrl, { active: true });
+    });
+
     // 通知接口配置菜单
     GM_registerMenuCommand("🔔 配置通知接口", () => {
         const configNames = [
@@ -2444,6 +3003,7 @@ Notice:
             configStr += `   状态: ${saved ? "✅ 已配置" : "❌ 未配置"}\n`;
             configStr += `   说明: ${item.hint}\n\n`;
         });
+        configStr += "自定义 Webhook 请在脚本设置的「Webhook」分组中配置。\n\n";
         configStr += "请输入要配置的编号 (1-7)，或输入 0 清除所有配置：";
         
         const choice = prompt(configStr);
@@ -2453,6 +3013,13 @@ Notice:
         if (num === 0) {
             if (confirm("确定要清除所有通知接口配置吗？")) {
                 configNames.forEach(item => GM_setValue(item.key, ""));
+                GM_setValue("Webhook.enabled", false);
+                GM_setValue("Webhook.url", "");
+                GM_setValue("Webhook.username", "");
+                GM_setValue("Webhook.password", "");
+                GM_setValue("Webhook.token", "");
+                GM_setValue("Webhook.headers", "");
+                GM_setValue("Webhook.body", "");
                 alert("所有通知接口配置已清除！");
             }
             return;
@@ -2489,7 +3056,9 @@ Notice:
         const bark = GM_getValue("Notice.bark", "");
         const telegramToken = GM_getValue("Notice.telegramToken", "");
         const telegramChatId = GM_getValue("Notice.telegramChatId", "");
-        
+        const webhookEnabled = GM_getValue("Webhook.enabled", false);
+        const webhookUrl = GM_getValue("Webhook.url", "");
+
         let status = "📊 通知接口配置状态：\n\n";
         status += `企业微信: ${wework ? "✅ 已配置" : "❌ 未配置"}\n`;
         status += `钉钉: ${dingding ? "✅ 已配置" : "❌ 未配置"}\n`;
@@ -2498,11 +3067,39 @@ Notice:
         status += `Bark: ${bark ? "✅ 已配置" : "❌ 未配置"}\n`;
         status += `Telegram Token: ${telegramToken ? "✅ 已配置" : "❌ 未配置"}\n`;
         status += `Telegram Chat ID: ${telegramChatId ? "✅ 已配置" : "❌ 未配置"}\n`;
+        status += `自定义 Webhook: ${webhookEnabled && webhookUrl ? "✅ 已启用" : "❌ 未启用"}\n`;
         alert(status);
     });
 
     const init = () => {
+        // 自动打开的打卡页只执行页面点击，不启动完整任务流程，避免重复运行
+        if (isAutoPunchContext()) {
+            return;
+        }
+
         TaskManager.init();
+
+        // 本次更新后默认开启「自动打开页面点击打卡」，只需迁移一次
+        if (!GM_getValue("Config.punchAutoMigrated", false)) {
+            GM_setValue("Tasks.punchcardAutoOpen", true);
+            GM_setValue("Config.punchAutoMigrated", true);
+        }
+
+        // 兼容旧版本：Telegram 配置曾短暂放在 Telegram 分组，现统一放回 Notice 分组
+        const legacyTelegramToken = GM_getValue("Telegram.telegramToken", "");
+        const legacyTelegramChatId = GM_getValue("Telegram.telegramChatId", "");
+        if (legacyTelegramToken) {
+            if (!GM_getValue("Notice.telegramToken", "")) {
+                GM_setValue("Notice.telegramToken", legacyTelegramToken);
+            }
+            GM_setValue("Telegram.telegramToken", "");
+        }
+        if (legacyTelegramChatId) {
+            if (!GM_getValue("Notice.telegramChatId", "")) {
+                GM_setValue("Notice.telegramChatId", legacyTelegramChatId);
+            }
+            GM_setValue("Telegram.telegramChatId", "");
+        }
 
         const consumeNoticeTestRequest = (request) => {
             if (!request || !request.id) return;

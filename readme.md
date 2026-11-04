@@ -25,12 +25,16 @@
 - 每日签入
 - 新闻阅读
 - 活动卡片
+- 打卡/任务卡片
+- 打卡页地址（可选，留空自动查找；每月变化无需手填）
+- 打卡：自动打开页面点击（后台点击无效，默认开启）
 - Quiz 自动答题
 - PC/移动搜索
 - 持续检测
 - 锁定国区
 - 搜索词来源
 - 账号备注（通知中显示的账号名，留空则显示「未获取到」）
+- 自定义 Webhook（地址、请求方法、认证方式、请求头、请求体）
 
 如果只想先测试，建议先关闭搜索任务，只开启签入和活动卡片。
 
@@ -56,7 +60,47 @@
 看这里
 https://github.com/codecodegogogo/Glados-Automatic-check-in#%E7%AC%AC-3-%E6%AD%A5%E5%88%9B%E5%BB%BA-telegram-%E6%9C%BA%E5%99%A8%E4%BA%BA
 
-## 六、MIT 修改声明
+## 六、自定义 Webhook 请求体模板
+
+**推荐使用令牌验证**
+
+Telegram 上收到的消息由三部分组成：
+
+```text
+发送时间
+脚本名
+最终汇总通知
+```
+
+在「Webhook → 自定义请求体」里可以用对应的占位符拼出同样的内容：
+
+- `{{time_json}}`：发送时间
+- `{{title_json}}`：脚本名
+- `{{content_json}}`：最终汇总通知全文
+
+以 ntfy 为例，Webhook 地址填 `https://ntfy.sh`，请求方法选 `POST`，请求格式选 `application/json`，请求体填：
+
+```json
+{
+  "topic": "bingrewards",
+  "title": "{{title_json}}",
+  "message": "{{time_json}}\n{{title_json}}\n{{content_json}}"
+}
+```
+
+这样 Webhook 收到的内容就和 Telegram 上那条一致。如果只想要汇总通知、不要时间和脚本名，把 `message` 改成：
+
+```json
+"message": "{{content_json}}"
+```
+
+注意：
+
+- `message` 里的 `\n` 要写成反斜杠加 n，不要直接换行，否则 JSON 会断开。
+- 脚本没有 `{{message}}` 占位符，正文统一用 `{{content_json}}`；直接写 `{{message}}` 不会被替换。
+- `topic` 里的 `lite` 换成你要订阅的主题，然后在 ntfy 客户端订阅同名主题。
+
+## 七、MIT 修改声明
 
 本项目基于一份已标注 MIT 许可证的多手修改版本继续维护。
 
